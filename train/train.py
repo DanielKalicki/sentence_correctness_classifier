@@ -116,12 +116,15 @@ def run(models, device, loader, optimizers, epoch, mode="train", scheduler=None)
                 optimizer_.zero_grad()
 
         with torch.cuda.amp.autocast():
-            pred_label = critic.forward(sents=(sent, sent_mask))
+            pred_label = actor.forward(sents=(sent, sent_mask))
+            value = critic.forward(sents=(sent, sent_mask), action=pred_label.detach())
+            reward = criterion(pred_label, label.to(torch.long)).detach()
+
+            critic_loss = torch.mean(torch.abs(value-reward))
 
             # print(pred_label.shape)
             # print(label.shape)
             # print(pred_label[0])
-            pred_loss = torch.mean(criterion(pred_label, label.to(torch.long)))
             # print(pred_loss.shape)
 
             # value_ = torch.sum(batch_loss, dim=-1)/torch.sum(label_mask, dim=-1)
