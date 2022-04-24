@@ -14,7 +14,8 @@ from tqdm import tqdm
 from datetime import datetime
 from transformers import AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("roberta-base")
+# tokenizer = AutoTokenizer.from_pretrained("roberta-base")
+tokenizer = AutoTokenizer.from_pretrained("distilroberta-base")
 print(tokenizer.vocab_size)
 
 random.seed(0)
@@ -117,9 +118,9 @@ class WikiSentCorrectnessBatch(Dataset):
 
     def __len__(self):
         if self.valid:
-            return int(batch_valid_data_size//16)
+            return int(batch_valid_data_size//(16))
         else:
-            return int(batch_train_data_size//(64))
+            return int(batch_train_data_size//(64*12*2))
 
     def get_title_from_idx(self):
         global train_title_list, valid_title_list
@@ -143,30 +144,47 @@ class WikiSentCorrectnessBatch(Dataset):
         title = self.get_title_from_idx()
         batch_data = batch_full_data[title]
 
-        # input sentences
-        rnd_input_sent_idx = random.randint(0, len(batch_data)-1)
-        text = batch_data[rnd_input_sent_idx]['text']
-        tokens_w = tokenizer.tokenize(text)
-        tokens = tokenizer.convert_tokens_to_ids(tokens_w)
-        if random.random() > 0.5:
-            sentence_changed = False
-            # for i_word, _ in enumerate(tokens):
-            #     if random.random() > 0.9:
-            #         tokens[i_word] = random.randint(0, tokenizer.vocab_size-1)
-            #         sentence_changed = True
-            if not sentence_changed:
-                idx = random.randint(0, len(tokens)-1)
-                tokens[idx] = random.randint(0, tokenizer.vocab_size-1)
-            label = 0
-            info['class'] = 'incorrect'
-        else:
-            label = 1
-            info['class'] = 'correct'
-        
-        sentences[0:min(len(tokens), int(self.max_sent_len))] =\
-            torch.LongTensor(tokens[0:min(len(tokens), int(self.max_sent_len))])
-        sentences_mask[0:min(len(tokens), int(self.max_sent_len))] = torch.tensor(0.0)
-        info['input_sentence'] = ' '.join(tokens_w[:int(self.max_sent_len)]).replace(' [PAD]', '')
+        batch_ok = False
+        while not batch_ok:
+            try:
+                # input sentences
+                rnd_input_sent_idx = random.randint(0, len(batch_data)-1)
+                text = batch_data[rnd_input_sent_idx]['text']
+                tokens_w = tokenizer.tokenize(text)
+                tokens_w = tokens_w[random.randint(0, max(1, len(tokens_w)-8)):]
+                tokens = tokenizer.convert_tokens_to_ids(tokens_w)
+                if random.random() > 0.5:
+                    if random.random() > 0.5: # word replace
+                        sentence_changed = False
+                        for i_word, _ in enumerate(tokens):
+                            if random.random() > 0.9:
+                                tokens[i_word] = random.randint(0, tokenizer.vocab_size-1)
+                                sentence_changed = True
+                        if not sentence_changed:
+                            idx = random.randint(0, len(tokens)-1)
+                            tokens[idx] = random.randint(0, tokenizer.vocab_size-1)
+                    else: # word shift
+                        for _ in range(3):
+                            idx1 = random.randint(0, len(tokens)-1)
+                            idx2 = random.randint(0, len(tokens)-2)
+                            if idx1 == idx2:
+                                idx2 = len(tokens)-1
+                            token_temp = tokens[idx1]
+                            tokens[idx1] = tokens[idx2]
+                            tokens[idx2] = token_temp
+                    label = 0
+                    info['class'] = 'incorrect'
+                else:
+                    label = 1
+                    info['class'] = 'correct'
+                
+                sentences[0:min(len(tokens), int(self.max_sent_len))] =\
+                    torch.LongTensor(tokens[0:min(len(tokens), int(self.max_sent_len))])
+                sentences_mask[0:min(len(tokens), int(self.max_sent_len))] = torch.tensor(0.0)
+                info['input_sentence'] = ' '.join(tokens_w[:int(self.max_sent_len)]).replace(' [PAD]', '')
+                batch_ok = True
+            except:
+                pass
 
         return sentences, sentences_mask, label, info
 

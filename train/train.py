@@ -17,6 +17,7 @@ import math
 import random
 import bitsandbytes as bnb
 from torch.distributions import Categorical
+import copy
 
 num_embeddings = 50265
 
@@ -45,55 +46,15 @@ if config['training']['log']:
     import wandb
     wandb.init(project='sentence_correctness_classifier', entity='danielkalicki', config=config)
 
-def train(models, device, loader, optimizers, epoch, scheduler):
-    loss = run(models, device, loader, optimizers, epoch, mode="train", scheduler=scheduler)
+def train(models, device, loader, epoch, worker_idx):
+    loss = run(models, device, loader, epoch, mode="train", worker_idx=worker_idx)
     return loss
 
-def test(models, device, loader, optimizers, epoch, scheduler):
-    loss = run(models, device, loader, optimizers, epoch, mode="test", scheduler=scheduler)
+def test(models, device, loader, epoch, worker_idx):
+    loss = run(models, device, loader, epoch, mode="test", worker_idx=worker_idx)
     return loss
 
-def calculate_mask_word_loss(batch_idx, info, pred_sentence, label_sent, label_mask, criterion):
-    try:
-        if batch_idx % 20 == 0:
-            pred_tokens = (list(torch.max(pred_sentence, 2)[1][0].cpu().detach()))
-            pred_tokens = [int(str(x).replace('tensor(', '').replace(')', '')) for x in pred_tokens]
-            pred_out = ''
-            input_sent_text = info['input_sentence'][0]
-            label_sent_text = info['label_sentence'][0]
-            pred_sent_text = ' '.join(tokenizer.convert_ids_to_tokens(pred_tokens))
-            for idx in range(0, 8): #len(label_sent_text.split(" "))):
-                pred_out += label_sent_text.split(" ")[idx]
-                if not label_mask[0].tolist()[idx]:
-                    pred_out += "[" + str(not label_mask[0].tolist()[idx])[0] + " " + pred_sent_text.split(" ")[idx] + "]" + " "
-                else:
-                    pred_out += " "
-            print("sentence:")
-            print(input_sent_text.replace('Ġ', ''))
-            print("memory sentence:")
-            print(' '.join(tokenizer.convert_ids_to_tokens(info['memory_words'][0])).replace('Ġ', ''))
-            print("prediction:")
-            print(pred_out.replace('Ġ', ''))
-    except:
-        pass
-
-    shape_ = pred_sentence.shape
-    pred_sentence = pred_sentence
-    label_sent = label_sent
-    label_mask = torch.logical_not(label_mask)
-
-    pred_sentence = pred_sentence * torch.cat([label_mask.unsqueeze(-1)]*pred_sentence.shape[-1], dim=-1)
-    label_sentence = label_sent * label_mask
-
-    pred_sentence = pred_sentence.reshape(-1, num_embeddings)
-    label_sentence = label_sentence.reshape(-1)
-    label_mask = label_mask.reshape(-1)
-
-    pred_loss = torch.sum(criterion(pred_sentence, label_sentence)*label_mask)/torch.sum(label_mask)
-    batch_loss = (criterion(pred_sentence, label_sentence)*label_mask).reshape(shape_[0], shape_[1])
-    return pred_loss, batch_loss, label_mask.reshape(shape_[0], shape_[1])
-
-def run(models, device, loader, optimizers, epoch, mode="train", scheduler=None):
+def run(models, device, loader, epoch, mode="train", worker_idx=0):
     start = time.time()
     pbar = tqdm(total=len(loader), dynamic_ncols=True)
     # criterion = torch.nn.BCEWithLogitsLoss(reduction='none')
@@ -112,48 +73,46 @@ def run(models, device, loader, optimizers, epoch, mode="train", scheduler=None)
         sent, sent_mask, label = sent.to(device), sent_mask.to(device), label.to(device)
 
         if mode == "train":
-            for optimizer_ in optimizers:
-                optimizer_.zero_grad()
+            for model in models:
+                model.zero_grad()
 
         with torch.cuda.amp.autocast():
+            # select action
             pred_label = actor.forward(sents=(sent, sent_mask))
-            value = critic.forward(sents=(sent, sent_mask), action=pred_label.detach())
-            reward = criterion(pred_label, label.to(torch.long)).detach()
+            action_probs = F.softmax(pred_label, dim=-1)
+            dist = Categorical(action_probs)
+            action = dist.sample()
+            action_one_hot = F.one_hot(action, num_classes=2).type(torch.FloatTensor).to(device)
 
-            critic_loss = torch.mean(torch.abs(value-reward))
+            # calculate reward
+            reward = criterion(action_one_hot, label.to(torch.long)).detach()
 
-            # print(pred_label.shape)
-            # print(label.shape)
-            # print(pred_label[0])
-            # print(pred_loss.shape)
+            # critic
+            value = critic.forward(sents=(sent, sent_mask), action=action_one_hot.detach())
+            critic_loss = torch.abs(reward-value).mean()
 
-            # value_ = torch.sum(batch_loss, dim=-1)/torch.sum(label_mask, dim=-1)
-            # # print((torch.sum(batch_loss, dim=-1)/torch.sum(label_mask, dim=-1)).shape)
+            # actor loss
+            advantage = value.detach()-reward.detach()
+            actor_loss = -(dist.log_prob(action)*advantage).mean()
 
-            # critic_loss = torch.mean(torch.abs(value-value_.detach())) # -(torch.mean(memory*pred_loss.detach()))
-
-            # log_prob = dist.log_prob(memory_words)
-            # # print(log_prob.shape)
-            # # print(value_[0])
-            # # print(value[0])
-            # # print(log_prob[0])
-            # # print(torch.mean(value_-value, dim=-1))
-            # # print(torch.mean(value_ - value, dim=-1).shape)
-            # actor_loss = -(log_prob * torch.cat([torch.mean(value_-value, dim=-1).detach().unsqueeze(1)]*log_prob.shape[1], dim=1)).mean()
-
-        if not math.isnan(float(pred_loss)):
+        if not math.isnan(float(actor_loss)) and not math.isnan(float(critic_loss)):
             batch_cnt += 1
             if mode == "train":
-                for optimizer in optimizers[1:]:
-                    scaler.scale(pred_loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                scaler.scale(actor_loss).backward()
+                scaler.step(actor.optimizer)
+                scaler.update()
+
+                scaler.scale(critic_loss).backward()
+                scaler.step(critic.optimizer)
+                scaler.update()
+
                 # torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['clipnorm'])
 
         _, pred = torch.max(pred_label, 1)
         correct_ = (float)(torch.sum(pred == label))
         total_ = (float)(pred.shape[0])
-        actor.add_batch_stats(loss=pred_loss.detach(), correct=correct_, total=total_)
+        actor.add_batch_stats(loss=actor_loss.detach(), correct=correct_, total=total_)
+        critic.add_batch_stats(loss=critic_loss.detach(), correct=0, total=0)
 
         pbar.update(1)
 
@@ -163,23 +122,25 @@ def run(models, device, loader, optimizers, epoch, mode="train", scheduler=None)
     print('Epoch {}:'.format(epoch))
     print('\t\t' + mode + ' time: {:.2f}'.format((end - start)))
     if config['training']['log']:
-        wandb.log({mode: {'loss_actor': actor.get_loss(),
-                          'loss_critic': critic.get_loss(),
-                          'accuracy_actor': actor.get_accuracy(),
-                          'accuracy_critic': critic.get_accuracy()}, 'epoch': epoch}, commit=True)
+        wandb.log({mode: {worker_idx: {'loss_actor': actor.get_loss(),
+                                       'loss_critic': critic.get_loss(),
+                                       'accuracy_actor': actor.get_accuracy(),
+                                       'accuracy_critic': critic.get_accuracy()}}, 
+                         'epoch': epoch}, commit=True)
 
-    return actor.get_loss()
+    return actor.get_accuracy()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# model
-actor = SentCorrClassActor(config)
-critic = SentCorrClassCritic(config)
-actor.to(device)
-critic.to(device)
+workers = []
 start_epoch = 1
 
-models = [actor, critic]
+# model
+for _ in range(4):
+    actor = SentCorrClassActor(config)
+    critic = SentCorrClassCritic(config)
+    actor.to(device)
+    critic.to(device)
+    workers.append([actor, critic])
 
 dataset_train = WikiSentCorrectnessBatch(config)
 data_loader_train = torch.utils.data.DataLoader(
@@ -188,16 +149,27 @@ data_loader_train = torch.utils.data.DataLoader(
 
 dataset_test = WikiSentCorrectnessBatch(config, valid=True)
 data_loader_test = torch.utils.data.DataLoader(
-    dataset_test, batch_size=3,
+    dataset_test, batch_size=1,
     shuffle=False, num_workers=0)
 
 tokenizer = dataset_train.tokenizer()
 
-optimizers = []
-for model in models:
-    optimizer = bnb.optim.Adam8bit(model.parameters(), config['training']['lr'], betas=(0.9, 0.995))
-    optimizers.append(optimizer)
-
 for epoch in range(start_epoch, config['training']['epochs'] + start_epoch):
-    train(models, device, data_loader_train, optimizers, epoch, None)
-    current_test_loss = test(models, device, data_loader_test, None, epoch, None)
+    best_worker = {'idx': -1, 'acc': 0}
+    for idx, models in enumerate(workers):
+        train(models, device, data_loader_train, epoch, idx)
+        test_acc = test(models, device, data_loader_test, epoch, idx)
+        if test_acc > best_worker['acc']:
+            best_worker['acc'] = test_acc
+            best_worker['idx'] = idx
+
+    for idx, models in enumerate(workers):
+        if idx != best_worker['idx']:
+            models[0].load_state_dict(workers[best_worker['idx']][0].state_dict())
+            models[1].load_state_dict(workers[best_worker['idx']][1].state_dict())
+
+    dataset_train.on_epoch_end()
+
+    for models in workers:
+        for model in models:
+            model.scheduler_step()

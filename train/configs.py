@@ -87,11 +87,11 @@ for _ in range(0, 100):
     if i == 0:
         word_edim = 768
         configs[i]['word_edim'] = word_edim
-        configs[i]['training']['lr'] = 1e-5
+        configs[i]['training']['lr'] = 1e-6
         configs[i]['training']['lr_step'] = 1
-        configs[i]['training']['lr_gamma'] = 0.98
+        configs[i]['training']['lr_gamma'] = 0.9
         configs[i]['training']['epochs'] = 20000
-        configs[i]['batch_size'] = 12
+        configs[i]['batch_size'] = 1
         configs[i]['max_sent_len'] = 24
 
     configs[i]['name'] = 'b' + str(configs[i]['batch_size']) + \
